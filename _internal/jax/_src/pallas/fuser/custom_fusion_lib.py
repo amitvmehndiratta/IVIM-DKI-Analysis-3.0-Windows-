@@ -1,0 +1,285 @@
+# Copyright 2025 The JAX Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+import dataclasses
+import functools
+from typing import Any, Protocol
+
+from jax._src import api_util
+from jax._src import core
+from jax._src import custom_api_util
+from jax._src import flattree as ft
+from jax._src.traceback_util import api_boundary
+from jax._src import tree_util
+from jax._src import util
+from jax._src.interpreters import mlir
+from jax._src.interpreters import partial_eval as pe
+from jax._src.pallas import core as pallas_core
+from jax._src.pallas.fuser import block_spec as block_spec_lib
+
+
+custom_fusion_p = core.Primitive('custom_fusion')
+custom_fusion_p.multiple_results = True
+
+CustomPullBlockSpecRuleFn = Callable[[tuple[block_spec_lib.BlockIndexTransform, ...]],
+                                     Sequence[block_spec_lib.BlockIndexTransform]]
+
+CustomPushBlockSpecRuleFn = Callable[[tuple[pallas_core.BlockSpec, ...]],
+                                     tuple[pallas_core.BlockSpec, ...]]
+
+@dataclasses.dataclass(frozen=True)
+class CustomEvalContext:
+  out_block_specs: tuple[pallas_core.BlockSpec, ...]
+  out_block_indices: tuple[Any, ...]
+  scalar_prefetch: Any | None = None
+
+class CustomEvalRuleFn(Protocol):
+
+  def __call__(
+      self,
+      ctx: CustomEvalContext,
+      *args: Any,
+  ) -> Sequence[Any]:
+    ...
+
+
+@custom_api_util.register_custom_decorator_type
+class custom_fusion:
+  """Wraps a pure JAX function as a primitive with user-defined fuser rules.
+
+  ``custom_fusion`` allows defining custom block spec propagation and block-level
+  evaluation rules for an operation so that it can participate in input and
+  output fusions without decomposing into its constituent JAX primitives.
+  Effects are not supported.
+
+  Rule registration methods and expected callback signatures:
+    - ``def_eval_rule(fn)``: Required. ``fn(ctx: CustomEvalContext, *args) ->
+      Sequence[Any]`` evaluates the operation on a single block and must return
+      a sequence of flat output leaves (even for a single output).
+    - ``def_pull_block_spec(fn)``: Required. ``fn(out_block_transforms:
+      tuple[BlockIndexTransform, ...]) -> Sequence[BlockIndexTransform]``
+      propagates output block transforms backward to the inputs.
+    - ``def_push_block_spec(fn)``: Optional (only needed for output fusions).
+      ``fn(in_block_specs: tuple[BlockSpec, ...]) -> tuple[BlockSpec, ...]``
+      propagates input ``BlockSpecs`` forward to the outputs.
+    - ``def_pallas_impl(fn)``: Optional alternative implementation for use inside
+      a Pallas kernel; must produce the same output abstract values as ``fun``.
+
+  Args:
+    fun: The pure JAX function defining the operation's abstract evaluation and
+      default eager/lowering behavior outside of a fused Pallas kernel.
+  """
+
+  fun: Callable[..., Any]
+
+  eval_rule: CustomEvalRuleFn | None = None
+
+  pull_block_spec_rule: CustomPullBlockSpecRuleFn | None = None
+
+  # Optional if this custom_fusion is only used as an input fusion.
+  push_block_spec_rule: CustomPushBlockSpecRuleFn | None = None
+
+  # Optional alternative implementation to use instead of `fun` for when this
+  # custom fusion is run inside a Pallas kernel.
+  pallas_impl: Callable[..., Any] | None = None
+
+  def __init__(self, fun: Callable[..., Any]):
+    functools.update_wrapper(self, fun)
+    self.fun = fun
+
+  def def_pallas_impl(self, pallas_impl):
+    self.pallas_impl = pallas_impl
+    return pallas_impl
+
+  def def_pull_block_spec(
+      self, pull_block_spec_rule: CustomPullBlockSpecRuleFn):
+    self.pull_block_spec_rule = pull_block_spec_rule
+    return pull_block_spec_rule
+
+  def def_push_block_spec(
+      self, push_block_spec_rule: CustomPushBlockSpecRuleFn):
+    self.push_block_spec_rule = push_block_spec_rule
+    return push_block_spec_rule
+
+  def def_eval_rule(self, eval_rule: CustomEvalRuleFn):
+    self.eval_rule = eval_rule
+    return eval_rule
+
+  @functools.partial(api_boundary,
+                     repro_api_name="jax.pallas.custom_fusion.__call__")
+  def __call__(self, *args, **kwargs):
+    debug_fun = api_util.debug_info("custom_fusion fun", self.fun, args, kwargs)
+
+    if self.eval_rule is None:
+      raise ValueError(
+          f"custom_fusion-decorated function {debug_fun.func_name} is missing "
+          "an evaluation rule (use def_eval_rule to define one)."
+      )
+    if self.pull_block_spec_rule is None:
+      raise ValueError(
+          f"custom_fusion-decorated function {debug_fun.func_name} is missing "
+          "a pull_block_spec rule (use def_pull_block_spec to define one)."
+      )
+
+    try:
+      args = api_util.resolve_kwargs(self.fun, args, kwargs)
+    except TypeError as e:
+      raise TypeError(
+          "The input arguments to the custom_fusion-decorated function "
+          f"{debug_fun.func_name} could not be resolved to positional-only "
+          f"arguments. Binding failed with the error:\n{e}"
+      ) from e
+
+    # flatten and get jaxpr
+    args_flat = tree_util.tree_leaves(args)
+    args_avals = tree_util.tree_map(core.typeof, args)
+    in_avals_ft = ft.flatten((args_avals, {}))
+    closed_jaxpr, out_avals_ft = pe.trace_to_jaxpr(
+        self.fun, in_avals_ft, debug_fun.with_unknown_names()
+    )
+    jaxpr = closed_jaxpr
+    consts = closed_jaxpr.consts
+    out_tree_val = out_avals_ft.tree
+
+    # if a Pallas implementation was provided, get its jaxpr
+    if self.pallas_impl is not None:
+      debug_pallas_impl = api_util.debug_info(
+          "custom_fusion pallas_impl", self.pallas_impl, args, kwargs)
+      pallas_closed_jaxpr, _ = pe.trace_to_jaxpr(
+          self.pallas_impl, in_avals_ft, debug_pallas_impl
+      )
+      pallas_jaxpr = pallas_closed_jaxpr
+      pallas_consts = pallas_closed_jaxpr.consts
+    else:
+      pallas_jaxpr = None
+      pallas_consts = []
+
+    # debug_info for rules
+    out_flat = custom_fusion_p.bind(
+        *consts,
+        *pallas_consts,
+        *args_flat,
+        jaxpr=jaxpr,
+        num_consts=len(consts),
+        eval_rule=self.eval_rule,
+        pull_block_spec_rule=self.pull_block_spec_rule,
+        push_block_spec_rule=self.push_block_spec_rule,
+        pallas_jaxpr=pallas_jaxpr,
+        pallas_num_consts=len(pallas_consts))
+
+    return tree_util.tree_unflatten(out_tree_val, out_flat)
+
+
+@custom_fusion_p.def_impl
+def _custom_fusion_impl(
+    *args,
+    jaxpr: core.Jaxpr,
+    num_consts: int,
+    pallas_num_consts: int,
+    **_):
+  consts, _, args = util.split_list(args, [num_consts, pallas_num_consts])
+  return core.eval_jaxpr(jaxpr, consts, *args)
+
+mlir.register_lowering(custom_fusion_p, mlir.lower_fun(
+    _custom_fusion_impl, multiple_results=True))
+
+
+@custom_fusion_p.def_effectful_abstract_eval
+def _custom_fusion_effectful_abstract_eval(
+    *args,
+    jaxpr: core.Jaxpr,
+    pallas_jaxpr: core.Jaxpr | None,
+    **_):
+  del args
+  if jaxpr.effects:
+    raise NotImplementedError(
+        f"custom_fusion-decorated function {jaxpr.debug_info.func_src_info} "
+        f"has effects, which is not yet supported: {jaxpr.effects}")
+  if pallas_jaxpr is not None:
+    if pallas_jaxpr.effects:
+      raise NotImplementedError(
+          f"custom_fusion-decorated function {jaxpr.debug_info.func_src_info} "
+          "has a pallas_impl with effects, which is not yet supported: "
+          f"{pallas_jaxpr.effects}")
+    if len(pallas_jaxpr.out_avals) != len(jaxpr.out_avals) or any(
+        p_aval.shape != j_aval.shape or p_aval.dtype != j_aval.dtype
+        for p_aval, j_aval in zip(pallas_jaxpr.out_avals, jaxpr.out_avals)
+    ):
+      raise ValueError(
+          f"custom_fusion-decorated function {jaxpr.debug_info.func_src_info} "
+          f"and its pallas_impl have mismatched output abstract values: "
+          f"{jaxpr.out_avals} vs {pallas_jaxpr.out_avals}"
+      )
+  return jaxpr.out_avals, jaxpr.effects
+
+
+@block_spec_lib.register_eval_rule(custom_fusion_p)
+def _custom_fusion_eval_rule(
+    ctx: block_spec_lib.KernelEvalContext,
+    *args,
+    eval_rule: CustomEvalRuleFn,
+    num_consts: int,
+    pallas_num_consts: int,
+    **_):
+  args = args[num_consts + pallas_num_consts:]
+  return eval_rule(CustomEvalContext(
+      out_block_specs=ctx.out_block_specs,
+      out_block_indices=ctx.get_out_block_indices(),
+      scalar_prefetch=ctx.scalar_prefetch,
+  ), *args)
+
+
+@block_spec_lib.register_pull_block_spec_rule(custom_fusion_p)
+def _custom_fusion_pull_block_spec_rule(
+    ctx : block_spec_lib.PullRuleContext,
+    out_block_transforms : tuple[block_spec_lib.BlockIndexTransform, ...],
+    *,
+    pull_block_spec_rule : CustomPullBlockSpecRuleFn,
+    **_,
+) -> Sequence[block_spec_lib.BlockIndexTransform]:
+  del ctx
+  return pull_block_spec_rule(out_block_transforms)
+
+
+@block_spec_lib.register_push_block_spec_rule(custom_fusion_p)
+def _custom_fusion_push_block_spec_rule(
+    ctx : block_spec_lib.PushRuleContext,
+    *block_specs : pallas_core.BlockSpec,
+    push_block_spec_rule : CustomPushBlockSpecRuleFn | None,
+    **_
+) -> tuple[pallas_core.BlockSpec, ...]:
+  del ctx
+  if push_block_spec_rule is None:
+    raise ValueError(
+        "custom_fusion is missing a push_block_spec rule "
+        "(use def_push_block_spec to define one)."
+    )
+  return push_block_spec_rule(block_specs)
+
+
+@block_spec_lib.register_usage_rule(custom_fusion_p)
+def _custom_fusion_usage_rule(
+    ctx : block_spec_lib.UsageRuleContext,
+    used_out: Sequence[set[block_spec_lib.Usage]],
+    *,
+    jaxpr: core.Jaxpr,
+    **_
+) -> Sequence[set[block_spec_lib.Usage]]:
+  del ctx
+  # TODO(jburnim): Error if jaxpr gives different usage than pallas_jaxpr?
+  read_usage_env = block_spec_lib.compute_usage(jaxpr, used_out)
+  return util.safe_map(read_usage_env, jaxpr.invars)

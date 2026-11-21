@@ -1,0 +1,26 @@
+"""MPMD main Python extension"""
+
+from typing import Self
+
+from jaxlib.mlir import ir
+
+import jaxlib.jaxlib.mlir.ir
+
+
+def register_dialect(context: ir.Context, load: bool = True) -> None: ...
+
+class UserOriginAttr(jaxlib.ir.Attribute):
+    @staticmethod
+    def isinstance(other_attribute: ir.Attribute) -> bool: ...
+
+    def __repr__(self) -> str: ...
+
+    @classmethod
+    def get(cls, name: str, transpose_count: int, context: ir.Context | None = None) -> Self:
+        """Creates a UserOriginAttr with the given user name and transpose count."""
+
+    @property
+    def user_name(self) -> str: ...
+
+    @property
+    def transpose_count(self) -> int: ...

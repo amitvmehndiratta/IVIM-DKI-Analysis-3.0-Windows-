@@ -1,0 +1,81 @@
+"""chlo main python extension"""
+
+from typing import Self
+
+from collections.abc import Sequence
+
+from jaxlib.mlir import ir
+
+import jaxlib.jaxlib.mlir.ir
+
+
+def register_dialect(context: ir.Context, load: bool = True) -> None: ...
+
+class ComparisonDirectionAttr(jaxlib.ir.Attribute):
+    @staticmethod
+    def isinstance(other_attribute: ir.Attribute) -> bool: ...
+
+    def __repr__(self) -> str: ...
+
+    @classmethod
+    def get(cls, value: str, context: ir.Context | None = None) -> Self:
+        """Creates a ComparisonDirection attribute with the given value."""
+
+    @property
+    def value(self) -> str: ...
+
+class ComparisonTypeAttr(jaxlib.ir.Attribute):
+    @staticmethod
+    def isinstance(other_attribute: ir.Attribute) -> bool: ...
+
+    def __repr__(self) -> str: ...
+
+    @classmethod
+    def get(cls, value: str, context: ir.Context | None = None) -> Self:
+        """Creates a ComparisonType attribute with the given value."""
+
+    @property
+    def value(self) -> str: ...
+
+class RaggedDotDimensionNumbers(jaxlib.ir.Attribute):
+    @staticmethod
+    def isinstance(other_attribute: ir.Attribute) -> bool: ...
+
+    def __repr__(self) -> str: ...
+
+    @classmethod
+    def get(cls, lhs_batching_dimensions: Sequence[int], rhs_batching_dimensions: Sequence[int], lhs_contracting_dimensions: Sequence[int], rhs_contracting_dimensions: Sequence[int], lhs_ragged_dimensions: Sequence[int], rhs_group_dimensions: Sequence[int], context: ir.Context | None = None) -> Self:
+        """
+        Creates a RaggedDotDimensionNumbers attribute with the given dimension configuration.
+        """
+
+    @property
+    def lhs_batching_dimensions(self) -> list[int]: ...
+
+    @property
+    def rhs_batching_dimensions(self) -> list[int]: ...
+
+    @property
+    def lhs_contracting_dimensions(self) -> list[int]: ...
+
+    @property
+    def rhs_contracting_dimensions(self) -> list[int]: ...
+
+    @property
+    def lhs_ragged_dimensions(self) -> list[int]: ...
+
+    @property
+    def rhs_group_dimensions(self) -> list[int]: ...
+
+class PrecisionAttr(jaxlib.ir.Attribute):
+    @staticmethod
+    def isinstance(other_attribute: ir.Attribute) -> bool: ...
+
+    def __repr__(self) -> str: ...
+
+    @classmethod
+    def get(cls, value: str, context: ir.Context | None = None) -> Self:
+        """Creates a Precision attribute with the given value."""
+
+    @property
+    def value(self) -> str: ...
